@@ -1,0 +1,31 @@
+{
+  "name": "document_ai_hub",
+  "version": "0.0.1",
+  "description": "Grounded Document hub with Chat capbilities",
+  "keywords": [
+    "RAG",
+    "Document",
+    "Grounding",
+    "AI",
+    "Chat"
+  ],
+  "homepage": "https://github.com/subhadipPal/DocumentAiHub#readme",
+  "bugs": {
+    "url": "https://github.com/subhadipPal/DocumentAiHub/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subhadipPal/DocumentAiHub.git"
+  },
+  "license": "ISC",
+  "author": "Subhadip Pal",
+  "type": "commonjs",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "aider:deepseek": "OLLAMA_API_BASE=http://127.0.0.1:11434 python3 -m aider --model ollama_chat/deepseek-r1:8b"
+  }
+}

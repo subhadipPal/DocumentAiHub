@@ -71,13 +71,13 @@ metadata:
 │   the config│     └──────────────────┘     │ 2. Search vectors │
 │   settings?"│                           ──▶│ 3. Retrieve top-K │
 └─────────────┘                           ──▶│ 4. Build prompt   │
-                                          │ 5. Call LLM       │
-         ▲                                 └────────┬─────────┘
-         │         Grounded Answer with          │
-         │         source citations                ▼
-         └──────────────────────┬─────────┌──────────────────┐
-                                │         │ LLM (API)        │
-                                └────────▶│                  │
+         ▲                                   │ 5. Call LLM       │
+         │         Grounded Answer with      └───────────────────┘
+                                                   ▼
+         │         source citations                └─────────┐
+         └──────────────────────┬─────────┌──────────────────┘
+                                │         │
+                                └────────▶│ LLM (API)        │
                                          └──────────────────┘
 
 ```
@@ -235,11 +235,247 @@ async function handleMCPRequest(request: { tool: string; params: Record<string, 
 *   **LLM Endpoints:** Anthropic Claude, OpenAI GPT-4 (configurable)
 *   **Testing:** Jest + Vitest, `vitest-mock-dns` for file system testing
 
-## 9. Roadmap Summary
-*   **Phase 1 (Current Focus):** Core ingestion (MD), chunking, and basic RAG chat loop functionality.
-*   **Phase 2 (Next):** Integrating production-grade components (Vector DB, API endpoints, advanced skills).
-*   **Phase 3:** Google Drive / NextCloud ingestion pipelines.
+## 9. Pseudocode: Core Layer Implementations (TypeScript)
+
+### 9.1 Ingestion Pipeline (Markdown → Chunks)
+```typescript
+// src/ingestion/parser.ts
+async function parseMarkdown(filePath: string): Promise<RawChunk[]> {
+  const text = await fs.readFile(filePath, 'utf-8');
+
+  // Split by headers (H1–H2), preserve structural context
+  const sections = text.split(/(?<=\n)#{1,2}\s/);
+
+  return sections.map((section, i) => ({
+    text: section.trim(),
+    metadata: { source: filePath, sectionIndex: i },
+  }));
+}
+
+// src/ingestion/chunker.ts — semantic chunking with overlap
+function semanticChunk(text: string, maxTokens: number = 512, overlap: number = 64): Chunk[] {
+  const chunks: Chunk[] = [];
+  let start = 0;
+
+  while (start < text.length) {
+    const end = Math.min(start + maxTokens, text.length);
+    const chunkText = text.slice(start, end).trim();
+
+    if (chunkText.length > 0) {
+      chunks.push({ text: chunkText, offset: start, length: end - start });
+    }
+
+    // Slide window with overlap
+    start += maxTokens - overlap;
+  }
+
+  return chunks;
+}
+
+// Combined pipeline
+async function ingestDocument(filePath: string): Promise<Chunk[]> {
+  const sections = await parseMarkdown(filePath);
+  return sections.flatMap(section => semanticChunk(section.text));
+}
+
+```
+
+### 9.2 Knowledge Representation (Embedding + Storage)
+```typescript
+// src/representation/embedder.ts
+interface EmbeddingService {
+  embed(text: string): Promise<number[]>; // returns vector array
+}
+
+// src/representation/vectorstore.ts
+interface IVectorStore {
+  add(id: string, vector: number[], metadata?: Record<string, any>): Promise<void>;
+  query(vector: number[], topK: number): Promise<Document[]>;
+}
+
+async function indexChunks(chunks: Chunk[], store: IVectorStore, embedder: EmbeddingService): Promise<void> {
+  for (const chunk of chunks) {
+    const vector = await embedder.embed(chunk.text);
+    await store.add(
+      chunk.id,
+      vector,
+      { source: chunk.metadata.source, sectionIndex: chunk.metadata.sectionIndex }
+    );
+  }
+}
+
+```
+
+### 9.3 Retrieval & Reasoning (RAG)
+```typescript
+// src/retrieval/rag.ts
+class RAGHandler {
+  constructor(private store: IVectorStore, private embedder: EmbeddingService) {}
+
+  async query(userQuery: string, topK: number = 5): Promise<GroundedResponse> {
+    // Step 1: Embed the query
+    const queryVector = await this.embedder.embed(userQuery);
+
+    // Step 2: Retrieve top-K matching chunks
+    const matches = await this.store.query(queryVector, topK);
+
+    // Step 3: Build augmented prompt
+    const context = matches.map(m => `---\n[MATCH] ${m.metadata.source}\n\n${m.text.substring(0, 500)}\n`).join('\n');
+    const prompt = `Answer the following question based on the retrieved context.\n\nContext:\n${context}\n\nQuestion: ${userQuery}\n\nAnswer:`;
+
+    // Step 4: Call LLM (via MCP service)
+    const llmResponse = await llmClient.generate(prompt);
+
+    return {
+      answer: llmResponse,
+      sources: matches.map(m => m.metadata.source),
+    };
+  }
+
+  async search(term: string, topK: number = 5): Promise<SearchResults> {
+    // Keyword-based search fallback for exact matches
+    const results = await this.store.searchByTerm(term, topK);
+    return { term, matches: results };
+  }
+}
+
+// src/retrieval/skillRouter.ts — dispatches to specialized agents
+class SkillRouter {
+  private skills: Record<string, SkillAgent>;
+
+  async execute(skillName: string, params: any): Promise<any> {
+    const agent = this.skills[skillName];
+    if (!agent) throw new Error(`Skill not found: ${skillName}`);
+
+    return agent.execute(params);
+  }
+
+  // Register skills dynamically
+  register(name: string, agent: SkillAgent): void {
+    this.skills[name] = agent;
+  }
+}
+
+// Example: skill-amp (amplified analysis)
+class SkillAmp implements SkillAgent {
+  async execute(params: { query: string; topK?: number }): Promise<any> {
+    const rag = new RAGHandler(store, embedder);
+    const result = await rag.query(params.query, params.topK);
+
+    // LLM post-processing: structure the answer with deep analysis
+    const analysis = await llmClient.generate(`Analyze deeply: ${result.answer}`);
+
+    return { type: 'analysis', result, analysis };
+  }
+}
+
+```
+
+### 9.4 MCP Layer (Orchestrator)
+```typescript
+// src/mcp/orchestrator.ts
+class MCPOrchestrator {
+  private history: ConversationHistory = [];
+
+  async process(userInput: string): Promise<Response> {
+    // Step 1: Intent classification (simple pattern matching or LLM-based)
+    const intent = classifyIntent(userInput);
+
+    // Step 2: Dispatch to handler
+    switch (intent) {
+      case 'query':
+        return await ragHandler.query(userInput);
+
+      case 'search':
+        const term = extractTerm(userInput);
+        return await ragHandler.search(term);
+
+      case 'analyze':
+        return await skillRouter.execute('skill-amp', { query: userInput });
+
+      default:
+        return ragHandler.query(userInput); // fallback to RAG
+    }
+
+    // Step 3: Store in history for multi-turn
+    this.history.push({ user: userInput, timestamp: Date.now() });
+  }
+
+  private classifyIntent(text: string): Intent {
+    const lower = text.toLowerCase();
+    if (/extract|find all|get all|list all/i.test(lower)) return 'analyze';
+    if (/search|find|keyword|contains/i.test(lower)) return 'search';
+    return 'query'; // default to RAG question answering
+  }
+}
+
+```
+
+## 10. Proposed TypeScript Module Map (src/ directory)
+
+```
+src/
+├── main.ts                    # Entry point: bootstraps the app
+│
+├── ingestion/                 # Document Ingestion Layer
+│   ├── parser.ts              # Markdown → Raw Text + metadata
+│   ├── chunker.ts             # Semantic chunking with overlap
+│   └── ingestionPipeline.ts   # Orchestrates parse → chunk → tag
+│
+├── representation/            # Knowledge Representation Layer
+│   ├── embedder.ts            # Embedding API client (OpenAI/Cohere)
+│   └── vectorstore.ts         # IVectorStore interface + implementations
+│
+├── retrieval/                 # Retrieval & Reasoning Layer
+│   ├── rag.ts                 # RAGHandler: query → embed → search → LLM
+│   └── skillRouter.ts         # SkillAgent dispatch and registration
+│
+├── mcp/                       # Model Context Protocol Layer
+│   ├── orchestrator.ts        # Intent classifier + dispatcher
+│   └── tools.ts               # MCP tool registry definitions
+│
+├── skills/                    # Specialized agents
+│   ├── skill-amp.ts           # Amplified analysis agent
+│   └── skill-extract.ts       # Structured data extraction agent
+│
+├── config/                    # Configuration & environment
+│   ├── env.ts                 # Load .env (API keys, vector DB, etc.)
+│   └── constants.ts           # Chunk size, overlap, topK defaults
+│
+└── types/                     # Shared TypeScript interfaces
+    ├── chunk.ts               # Chunk interface { text, metadata, id }
+    ├── embedding.ts           # EmbeddingService + IVectorStore interfaces
+    └── mcp/                   # MCPTool definitions, ConversationHistory
+```
+
+## 11. ASCII: Module Dependency Flow
+
+```
+┌──────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│  main.ts     │───▶│  mcp/           │    │ ingestion/      │
+│              │    │  orchestrator  │    │  parser +       │
+└──────────────┘    └───────┬───────┘    │  chunker        │
+                            │            └────────┬────────┘
+         calls dispatch to     │                    │
+                  ▼           │                    ▼
+              ┌─────────────┐    ┌───────────────────┐
+              │ rag.ts      │◀──▶│ representation/   │
+              │             │    │  embedder +       │
+              └──────┬──────┘    │  vectorstore      │
+                     │           └───────────────────┘
+                     │ uses
+              ┌──────▼──────┐
+              │ skillRouter │
+              └──────┬──────┘
+                     │ delegates to
+              ┌──────▼──────┐
+              │  skills/    │
+              │ skill-amp   │
+              └─────────────┘
+
+```
 
 ---
 
-*This architecture provides a blueprint for the Document AI Hub's functionality.*
+**ARCHITECTURE.md complete.** Ready to move on to **RAG_MCP_PLAN.md** (adding pseudocode and diagrams there)? Or would you prefer to adjust anything in the architecture first?
+
