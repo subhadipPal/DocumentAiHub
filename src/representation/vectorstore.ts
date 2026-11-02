@@ -1,6 +1,5 @@
 import { Pool } from 'pg';
 import { FileMetadata } from '../types/chunk';
-import { SourceFile } from '../types/chunk';
 
 /**
  * PostgreSQL implementation for Vector Storage using pgvector.
@@ -22,6 +21,9 @@ export class PgVectorStore {
    */
   private async initialize() {
     try {
+      // Enable the vector extension
+      await this.pool.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+
       // Ensure the table exists
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS ${this.tableName} (
@@ -38,6 +40,7 @@ export class PgVectorStore {
       console.log(`Verified ${this.tableName} table and index.`);
     } catch (error) {
       console.error('Initialization error:', error);
+      throw error;
     }
   }
 
